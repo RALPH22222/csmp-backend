@@ -2,8 +2,32 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { supabase } from '../config/supabase.js';
 import { Keypair } from '@stellar/stellar-sdk';
+import crypto from 'crypto';
+
+// Setup symmetric encryption for in-memory password protection
+const ENCRYPTION_KEY = process.env.JWT_SECRET ? crypto.scryptSync(process.env.JWT_SECRET, 'salt', 32) : crypto.scryptSync('fallback_secret_key', 'salt', 32);
+const IV_LENGTH = 16;
+
+const encryptText = (text) => {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+};
+
+const decryptText = (text) => {
+    const textParts = text.split(':');
+    const iv = Buffer.from(textParts.shift(), 'hex');
+    const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+};
 
 const otpStore = new Map();
+const loginOtpStore = new Map();
 
 // Generate a random 6-digit OTP
 const generateOTP = () => {
@@ -12,16 +36,17 @@ const generateOTP = () => {
 
 const formatE164 = (phone) => {
     let digits = phone.replace(/\D/g, ''); // Ensure only digits
-    if (digits.startsWith('63')) return '+' + digits;
-    if (digits.startsWith('09')) return '+63' + digits.substring(1);
-    if (digits.startsWith('9')) return '+63' + digits;
-    return '+' + digits; // Fallback
+    if (digits.startsWith('63')) return digits;
+    if (digits.startsWith('09')) return '63' + digits.substring(1);
+    if (digits.startsWith('9')) return '63' + digits;
+    return digits; // Fallback
 };
 
 const sendOtpSms = async (mobilePhone, otp) => {
     try {
         const formattedPhone = formatE164(mobilePhone);
-        console.log(`📡 Dispatching SMS to formatted number: ${formattedPhone}`);
+        const apiPhone = '+' + formattedPhone; // SMS API strictly requires the + prefix
+        console.log(`📡 Dispatching SMS to formatted number: ${apiPhone}`);
 
         const response = await fetch('https://smsapiph.onrender.com/api/v1/send/sms', {
             method: 'POST',
@@ -30,7 +55,7 @@ const sendOtpSms = async (mobilePhone, otp) => {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                recipient: formattedPhone,
+                recipient: apiPhone,
                 message: `Your CSMP verification code is ${otp}`
             })
         });
@@ -72,7 +97,7 @@ export const register = async (req, res) => {
         // Store user payload temporarily with the OTP
         otpStore.set(mobilePhone, {
             otp,
-            password, // Save raw password temporarily to create Supabase Auth user
+            password: encryptText(password), // Encrypt the password securely in memory
             stellarSecretKey, // Save secret key to return to user upon verification
             expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
             userData: {
@@ -125,18 +150,37 @@ export const verifyOtp = async (req, res) => {
 
         // Create user in Supabase Auth to get auth_id
         const formattedPhone = formatE164(mobilePhone);
-        const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+        let authUserId;
+        
+        const { data: createData, error: authError } = await supabase.auth.admin.createUser({
             phone: formattedPhone,
-            password: record.password,
+            password: decryptText(record.password), // Decrypt the password we safely stored in memory earlier
             phone_confirm: true
         });
 
         if (authError) {
-            throw new Error(`Auth Error: ${authError.message}`);
+            if (authError.message.includes('already registered')) {
+                // If they already tried to register before but failed halfway, their account might be stuck in Supabase Auth.
+                const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+                    phone: formattedPhone,
+                    password: decryptText(record.password)
+                });
+                
+                if (signInData && signInData.user) {
+                    authUserId = signInData.user.id;
+                } else {
+                    // If we can't log them in, they need to manually delete the stuck account from the dashboard
+                    throw new Error('Phone number is stuck in Supabase Auth from a previous failed attempt. Please go to Supabase Dashboard > Authentication > Users and delete it.');
+                }
+            } else {
+                throw new Error(`Auth Error: ${authError.message}`);
+            }
+        } else {
+            authUserId = createData.user.id;
         }
 
         // Assign the generated auth_id to the users table payload
-        record.userData.auth_id = authData.user.id;
+        record.userData.auth_id = authUserId;
 
         // OTP is valid! Insert into database
         const { data: newUser, error: dbError } = await supabase
@@ -147,30 +191,157 @@ export const verifyOtp = async (req, res) => {
 
         if (dbError) {
             // Rollback Auth user if public.users insert fails
-            await supabase.auth.admin.deleteUser(authData.user.id);
+            await supabase.auth.admin.deleteUser(authUserId);
             throw new Error(`DB Error: ${dbError.message}`);
         }
 
         // Clean up OTP
         otpStore.delete(mobilePhone);
 
-        // Generate JWT
-        const token = jwt.sign(
-            { id: newUser.id, phone: newUser.phone_number },
-            process.env.JWT_SECRET || 'fallback_secret_key',
-            { expiresIn: '7d' }
-        );
+        // Sign the user in with Supabase Auth to generate a real session
+        const { data: sessionData, error: signInError } = await supabase.auth.signInWithPassword({
+            phone: formattedPhone,
+            password: decryptText(record.password)
+        });
 
         return res.status(201).json({ 
             success: true, 
             message: 'Registration successful',
-            token,
+            session: sessionData?.session || null,
+            token: sessionData?.session?.access_token || null,
             user: newUser,
             stellarSecretKey: record.stellarSecretKey
         });
 
     } catch (error) {
         console.error('OTP Verification Error:', error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// LOGIN
+export const login = async (req, res) => {
+    try {
+        const { mobilePhone, password } = req.body;
+
+        if (!mobilePhone || !password) {
+            return res.status(400).json({ success: false, message: 'Phone and password are required' });
+        }
+
+        const formattedPhone = formatE164(mobilePhone);
+
+        console.log('--- LOGIN DEBUG ---');
+        console.log('Raw Phone:', mobilePhone);
+        console.log('Formatted Phone:', formattedPhone);
+        console.log('Password (length):', password.length, password);
+        console.log('-------------------');
+
+        // Verify credentials with Supabase
+        const { data: sessionData, error: signInError } = await supabase.auth.signInWithPassword({
+            phone: formattedPhone,
+            password
+        });
+
+        if (signInError) {
+            console.error('Supabase Login Error:', signInError.message);
+            return res.status(401).json({ success: false, message: `Auth Error: ${signInError.message}` });
+        }
+
+        // Fetch user profile from public.users
+        const { data: userProfile, error: userError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('auth_id', sessionData.user.id)
+            .single();
+
+        // Generate OTP for 2FA
+        const otp = generateOTP();
+
+        // Store session Data temporarily
+        loginOtpStore.set(mobilePhone, {
+            otp,
+            sessionData,
+            userProfile,
+            expiresAt: Date.now() + 5 * 60 * 1000 // 5 mins
+        });
+
+        await sendOtpSms(mobilePhone, otp);
+
+        return res.status(200).json({ 
+            success: true, 
+            requireOtp: true,
+            message: 'OTP sent for login verification'
+        });
+
+    } catch (error) {
+        console.error('Login Error:', error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// VERIFY LOGIN OTP
+export const verifyLoginOtp = async (req, res) => {
+    try {
+        const { mobilePhone, otp } = req.body;
+
+        if (!mobilePhone || !otp) {
+            return res.status(400).json({ success: false, message: 'Phone and OTP are required' });
+        }
+
+        const record = loginOtpStore.get(mobilePhone);
+
+        if (!record) {
+            return res.status(404).json({ success: false, message: 'OTP not found or expired' });
+        }
+
+        if (Date.now() > record.expiresAt) {
+            loginOtpStore.delete(mobilePhone);
+            return res.status(400).json({ success: false, message: 'OTP has expired' });
+        }
+
+        if (record.otp !== otp) {
+            return res.status(400).json({ success: false, message: 'Invalid OTP' });
+        }
+
+        // OTP is valid
+        loginOtpStore.delete(mobilePhone);
+
+        return res.status(200).json({
+            success: true,
+            message: 'Login successful',
+            session: record.sessionData.session,
+            token: record.sessionData.session.access_token,
+            user: record.userProfile
+        });
+
+    } catch (error) {
+        console.error('Login OTP Error:', error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// REFRESH SESSION
+export const refreshSession = async (req, res) => {
+    try {
+        const { refresh_token } = req.body;
+        if (!refresh_token) {
+            return res.status(400).json({ success: false, message: 'Refresh token is required' });
+        }
+
+        const { data, error } = await supabase.auth.refreshSession({ refresh_token });
+
+        if (error) {
+            return res.status(401).json({ success: false, message: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            session: data.session,
+            token: data.session.access_token
+        });
+
+    } catch (error) {
+        console.error('Refresh Error:', error);
         return res.status(500).json({ success: false, message: error.message });
     }
 };

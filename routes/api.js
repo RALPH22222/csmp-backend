@@ -1,6 +1,6 @@
 import express from 'express';
 import { createPool, joinPool, contribute, payout, getPoolState } from '../controllers/poolController.js';
-import { register, verifyOtp, resendOtp } from '../controllers/authController.js';
+import { register, verifyOtp, resendOtp, login, verifyLoginOtp, refreshSession } from '../controllers/authController.js';
 
 const router = express.Router();
 
@@ -14,5 +14,8 @@ router.get('/pools/:poolId/state', getPoolState);
 router.post('/auth/register', register);
 router.post('/auth/verify-otp', verifyOtp);
 router.post('/auth/resend-otp', resendOtp);
+router.post('/auth/login', login);
+router.post('/auth/verify-login', verifyLoginOtp);
+router.post('/auth/refresh', refreshSession);
 
 export default router;
