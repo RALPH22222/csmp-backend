@@ -1,12 +1,12 @@
 import express from 'express';
-import { getMessages, addMessage } from '../controllers/dataController.js';
+import { createPool, joinPool, contribute, payout, getPoolState } from '../controllers/poolController.js';
 
 const router = express.Router();
 
-// GET /api/messages
-router.get('/messages', getMessages);
-
-// POST /api/messages
-router.post('/messages', addMessage);
+router.post('/pools', createPool);
+router.post('/pools/:poolId/join', joinPool);
+router.post('/pools/:poolId/contribute', contribute);
+router.post('/pools/:poolId/payout', payout);
+router.get('/pools/:poolId/state', getPoolState);
 
 export default router;
