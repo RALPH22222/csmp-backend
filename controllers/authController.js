@@ -83,8 +83,6 @@ export const register = async (req, res) => {
                 date_of_birth: new Date(dateOfBirth).toISOString().split('T')[0], // Convert to YYYY-MM-DD
                 sex,
                 stellar_public_key: stellarPublicKey
-                // Note: password is intentionally omitted as it doesn't exist in the users table schema.
-                // If you are using Supabase Auth, you will need to create the auth user first.
             }
         });
 
@@ -127,36 +125,18 @@ export const verifyOtp = async (req, res) => {
 
         // Create user in Supabase Auth to get auth_id
         const formattedPhone = formatE164(mobilePhone);
-        let authUserId;
-        
-        const { data: createData, error: authError } = await supabase.auth.admin.createUser({
+        const { data: authData, error: authError } = await supabase.auth.admin.createUser({
             phone: formattedPhone,
             password: record.password,
             phone_confirm: true
         });
 
         if (authError) {
-            if (authError.message.includes('already registered')) {
-                // Attempt to fetch the existing user's ID by logging in
-                const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-                    phone: formattedPhone,
-                    password: record.password
-                });
-                
-                if (signInData && signInData.user) {
-                    authUserId = signInData.user.id;
-                } else {
-                    throw new Error(`Phone number is stuck in Supabase Auth from a previous failed attempt. Please go to Supabase Dashboard > Authentication > Users and delete it.`);
-                }
-            } else {
-                throw new Error(`Auth Error: ${authError.message}`);
-            }
-        } else {
-            authUserId = createData.user.id;
+            throw new Error(`Auth Error: ${authError.message}`);
         }
 
         // Assign the generated auth_id to the users table payload
-        record.userData.auth_id = authUserId;
+        record.userData.auth_id = authData.user.id;
 
         // OTP is valid! Insert into database
         const { data: newUser, error: dbError } = await supabase
@@ -166,27 +146,25 @@ export const verifyOtp = async (req, res) => {
             .single();
 
         if (dbError) {
-            // Only rollback if we were the ones who just created the user
-            if (createData && createData.user) {
-                await supabase.auth.admin.deleteUser(createData.user.id);
-            }
+            // Rollback Auth user if public.users insert fails
+            await supabase.auth.admin.deleteUser(authData.user.id);
             throw new Error(`DB Error: ${dbError.message}`);
         }
 
         // Clean up OTP
         otpStore.delete(mobilePhone);
 
-        // Sign the user in with Supabase Auth to generate a real session
-        const { data: sessionData, error: signInError } = await supabase.auth.signInWithPassword({
-            phone: formattedPhone,
-            password: record.password
-        });
+        // Generate JWT
+        const token = jwt.sign(
+            { id: newUser.id, phone: newUser.phone_number },
+            process.env.JWT_SECRET || 'fallback_secret_key',
+            { expiresIn: '7d' }
+        );
 
         return res.status(201).json({ 
             success: true, 
             message: 'Registration successful',
-            session: sessionData?.session || null,
-            token: sessionData?.session?.access_token || null,
+            token,
             user: newUser,
             stellarSecretKey: record.stellarSecretKey
         });
