@@ -4,12 +4,29 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import apiRoutes from './routes/api.js';
+import rateLimit from 'express-rate-limit';
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 app.use('/api', apiRoutes);
+app.get('/', (req, res) => {
+    res.send('CSMP Backend is running!');
+});
+
+// RATE LIMITING
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    max: 100, // 100 requests
+    message: { error: 'Too many requests from this IP, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+app.use(limiter);
 
 app.get('/api/health', (_, res) => res.json({ ok: true }));
 
