@@ -25,10 +25,10 @@ export const createPool = async (req, res) => {
 
     await buildAndSubmit([
       invokeOp(contract_address, 'create_pool', [
-        pool.id,
-        total_members,
-        contribution_amount.toString(),
-        PHP_TOKEN_ADDRESS,
+        { value: pool.id, type: 'string' },
+        { value: total_members, type: 'u32' },
+        { value: contribution_amount, type: 'i128' },
+        { value: PHP_TOKEN_ADDRESS, type: 'address' },
       ]),
     ]);
 
@@ -67,9 +67,9 @@ export const joinPool = async (req, res) => {
 
     await buildAndSubmit([
       invokeOp(pool.soroban_contract_address, 'add_member', [
-        poolId,
-        userRecord.stellar_public_key,
-        sequence,
+        { value: poolId, type: 'string' },
+        { value: userRecord.stellar_public_key, type: 'address' },
+        { value: sequence, type: 'u32' },
       ]),
     ]);
 
@@ -99,9 +99,21 @@ export const contribute = async (req, res) => {
     const memberAddr = member.users.stellar_public_key;
     const amountUnits = toTokenUnits(pool.cycle_contribution_amount);
 
+    // First tx: transfer tokens from member to contract
     await buildAndSubmit([
-      invokeOp(PHP_TOKEN_ADDRESS, 'transfer', [memberAddr, contractAddress, amountUnits]),
-      invokeOp(contractAddress, 'contribute', [poolId, memberAddr]),
+      invokeOp(PHP_TOKEN_ADDRESS, 'transfer', [
+        { value: memberAddr, type: 'address' },
+        { value: contractAddress, type: 'address' },
+        { value: amountUnits, type: 'i128' },
+      ]),
+    ]);
+
+    // Second tx: register the contribution in the contract's state
+    await buildAndSubmit([
+      invokeOp(contractAddress, 'contribute', [
+        { value: poolId, type: 'string' },
+        { value: memberAddr, type: 'address' },
+      ]),
     ]);
 
     await supabase.from('transactions').insert({
@@ -129,7 +141,9 @@ export const payout = async (req, res) => {
     if (error) throw error;
 
     await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'payout', [poolId]),
+      invokeOp(pool.soroban_contract_address, 'payout', [
+        { value: poolId, type: 'string' },
+      ]),
     ]);
 
     return res.json({ success: true });
@@ -149,11 +163,19 @@ export const getPoolState = async (req, res) => {
     if (error) throw error;
 
     const rawState = await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'get_pool_state', [poolId]),
+      invokeOp(pool.soroban_contract_address, 'get_pool_state', [
+        { value: poolId, type: 'string' },
+      ]),
     ]);
 
     const state = scValToNative(rawState);
-    return res.json(state);
+
+    // Convert any BigInt fields to strings for JSON serialization
+    const serializable = JSON.parse(
+      JSON.stringify(state, (_, value) => (typeof value === 'bigint' ? value.toString() : value))
+    );
+
+    return res.json(serializable);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
