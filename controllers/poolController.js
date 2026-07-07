@@ -1,7 +1,22 @@
 import { supabase } from '../config/supabase.js';
 import { PHP_TOKEN_ADDRESS } from '../config/stellar.js';
-import { invokeOp, buildAndSubmit, toTokenUnits } from '../utils/stellar.js';
-import { scValToNative } from '@stellar/stellar-sdk';
+import { invokeOp, toTokenUnits, buildAndSubmit, submitUserOp, scArg } from '../utils/stellar.js';
+import { Keypair, scValToNative } from '@stellar/stellar-sdk';
+import crypto from 'crypto';
+
+const ENCRYPTION_KEY = process.env.JWT_SECRET
+  ? crypto.scryptSync(process.env.JWT_SECRET, 'salt', 32)
+  : crypto.scryptSync('fallback_secret_key', 'salt', 32);
+
+const decryptText = (text) => {
+  const textParts = text.split(':');
+  const iv = Buffer.from(textParts.shift(), 'hex');
+  const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+};
 
 export const createPool = async (req, res) => {
   try {
@@ -12,7 +27,7 @@ export const createPool = async (req, res) => {
       .from('pools')
       .insert({
         pool_name: name,
-        pool_status_id: 1,               // FORMING
+        pool_status_id: 1,
         total_payout_amount: total_payout,
         cycle_contribution_amount: contribution_amount,
         cycle_duration_days,
@@ -25,10 +40,10 @@ export const createPool = async (req, res) => {
 
     await buildAndSubmit([
       invokeOp(contract_address, 'create_pool', [
-        { value: pool.id, type: 'string' },
-        { value: total_members, type: 'u32' },
-        { value: contribution_amount, type: 'i128' },
-        { value: PHP_TOKEN_ADDRESS, type: 'address' },
+        scArg(pool.id, 'string'),
+        scArg(total_members, 'u32'),
+        scArg(toTokenUnits(contribution_amount), 'i128'),
+        PHP_TOKEN_ADDRESS,
       ]),
     ]);
 
@@ -51,7 +66,7 @@ export const joinPool = async (req, res) => {
       .insert({
         pool_id: poolId,
         user_id,
-        member_status_id: 1,             // ACTIVE
+        member_status_id: 1,
         payout_sequence_number: sequence,
       })
       .select()
@@ -67,9 +82,9 @@ export const joinPool = async (req, res) => {
 
     await buildAndSubmit([
       invokeOp(pool.soroban_contract_address, 'add_member', [
-        { value: poolId, type: 'string' },
-        { value: userRecord.stellar_public_key, type: 'address' },
-        { value: sequence, type: 'u32' },
+        scArg(poolId, 'string'),
+        userRecord.stellar_public_key,
+        scArg(sequence, 'u32'),
       ]),
     ]);
 
@@ -89,7 +104,7 @@ export const contribute = async (req, res) => {
 
     const { data: member, error: memberErr } = await supabase
       .from('pool_members')
-      .select('*, users(stellar_public_key)')
+      .select('*, users(stellar_public_key, stellar_secret)')
       .eq('pool_id', poolId)
       .eq('user_id', user_id)
       .single();
@@ -97,24 +112,32 @@ export const contribute = async (req, res) => {
 
     const contractAddress = pool.soroban_contract_address;
     const memberAddr = member.users.stellar_public_key;
+    const encryptedSecret = member.users.stellar_secret;
+    if (!encryptedSecret) return res.status(400).json({ error: 'User secret not available' });
+
+    const userSecret = decryptText(encryptedSecret);
+    const userKeypair = Keypair.fromSecret(userSecret);
     const amountUnits = toTokenUnits(pool.cycle_contribution_amount);
 
-    // First tx: transfer tokens from member to contract
-    await buildAndSubmit([
+    // Soroban allows only one invokeHostFunction op per tx — send as two.
+    await submitUserOp(
+      memberAddr,
+      userKeypair,
       invokeOp(PHP_TOKEN_ADDRESS, 'transfer', [
-        { value: memberAddr, type: 'address' },
-        { value: contractAddress, type: 'address' },
-        { value: amountUnits, type: 'i128' },
-      ]),
-    ]);
+        memberAddr,
+        contractAddress,
+        scArg(amountUnits, 'i128'),
+      ])
+    );
 
-    // Second tx: register the contribution in the contract's state
-    await buildAndSubmit([
+    await submitUserOp(
+      memberAddr,
+      userKeypair,
       invokeOp(contractAddress, 'contribute', [
-        { value: poolId, type: 'string' },
-        { value: memberAddr, type: 'address' },
-      ]),
-    ]);
+        scArg(poolId, 'string'),
+        memberAddr,
+      ])
+    );
 
     await supabase.from('transactions').insert({
       pool_member_id: member.id,
@@ -141,9 +164,7 @@ export const payout = async (req, res) => {
     if (error) throw error;
 
     await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'payout', [
-        { value: poolId, type: 'string' },
-      ]),
+      invokeOp(pool.soroban_contract_address, 'payout', [scArg(poolId, 'string')]),
     ]);
 
     return res.json({ success: true });
@@ -163,19 +184,13 @@ export const getPoolState = async (req, res) => {
     if (error) throw error;
 
     const rawState = await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'get_pool_state', [
-        { value: poolId, type: 'string' },
-      ]),
+      invokeOp(pool.soroban_contract_address, 'get_pool_state', [scArg(poolId, 'string')]),
     ]);
 
-    const state = scValToNative(rawState);
-
-    // Convert any BigInt fields to strings for JSON serialization
-    const serializable = JSON.parse(
-      JSON.stringify(state, (_, value) => (typeof value === 'bigint' ? value.toString() : value))
+    const state = JSON.parse(
+      JSON.stringify(scValToNative(rawState), (_, v) => (typeof v === 'bigint' ? v.toString() : v))
     );
-
-    return res.json(serializable);
+    return res.json(state);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
