@@ -14,15 +14,7 @@ import {
 } from "../config/stellar.js";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.js";
-import { Keypair } from "@stellar/stellar-sdk";
 import crypto from "crypto";
-import {
-  PHP_TOKEN_ADDRESS,
-  stellarRpc,
-  networkPassphrase,
-} from "../config/stellar.js";
-import { invokeOp } from "../utils/stellar.js";
-import { TransactionBuilder, BASE_FEE } from "@stellar/stellar-sdk";
 
 // --------------------------------------------------------------
 // Encryption helpers (AES-256-CBC)
@@ -97,7 +89,6 @@ const sendOtpSms = async (mobilePhone, otp) => {
 // --------------------------------------------------------------
 // Helper: set up user's Stellar account (fund + trustline)
 // --------------------------------------------------------------
-
 async function setupUserStellarAccount(publicKey, secretKey) {
   try {
     console.log(`💧 Funding ${publicKey} via Friendbot...`);
@@ -439,24 +430,20 @@ export const login = async (req, res) => {
         };
         signInError = null;
       } else {
-        return res
-          .status(401)
-          .json({
-            success: false,
-            message:
-              "Auth Error: Invalid login credentials or user not registered.",
-          });
+        return res.status(401).json({
+          success: false,
+          message:
+            "Auth Error: Invalid login credentials or user not registered.",
+        });
       }
     }
 
     if (signInError) {
       console.error("Supabase Login Error:", signInError.message);
-      return res
-        .status(401)
-        .json({
-          success: false,
-          message: `Auth Error: ${signInError.message}`,
-        });
+      return res.status(401).json({
+        success: false,
+        message: `Auth Error: ${signInError.message}`,
+      });
     }
 
     const { data: userProfile, error: userError } = await supabase
@@ -581,12 +568,10 @@ export const resendOtp = async (req, res) => {
 
     const record = otpStore.get(mobilePhone);
     if (!record) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "User session not found. Please restart registration.",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "User session not found. Please restart registration.",
+      });
     }
 
     const newOtp = generateOTP();
