@@ -20,7 +20,7 @@ const decryptText = (text) => {
 
 export const createPool = async (req, res) => {
   try {
-    const { name, total_members, contribution_amount, cycle_duration_days, max_members, contract_address } = req.body;
+    const { name, total_members, contribution_amount, cycle_duration_days, max_members, contract_address, organizer_id } = req.body;
     const total_payout = max_members * contribution_amount;
 
     const { data: pool, error } = await supabase
@@ -33,6 +33,7 @@ export const createPool = async (req, res) => {
         cycle_duration_days,
         max_members,
         soroban_contract_address: contract_address,
+        organizer_id: organizer_id,
       })
       .select()
       .single();
@@ -191,6 +192,54 @@ export const getPoolState = async (req, res) => {
       JSON.stringify(scValToNative(rawState), (_, v) => (typeof v === 'bigint' ? v.toString() : v))
     );
     return res.json(state);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export const getAllPools = async (req, res) => {
+  try {
+    const { data: pools, error } = await supabase
+      .from('pools')
+      .select('*, pool_statuses(status_name)');
+    
+    if (error) throw error;
+    return res.json(pools);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export const getMyPools = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Fetch pools where the user is a member
+    const { data: members, error } = await supabase
+      .from('pool_members')
+      .select('pool_id, pools(*, pool_statuses(status_name))')
+      .eq('user_id', userId);
+      
+    if (error) throw error;
+
+    const myPools = members.map(m => m.pools);
+    return res.json(myPools);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+export const getPoolById = async (req, res) => {
+  try {
+    const { poolId } = req.params;
+    const { data: pool, error } = await supabase
+      .from('pools')
+      .select('*, pool_statuses(status_name), pool_members(*, users(first_name, last_name), member_statuses(status_name))')
+      .eq('id', poolId)
+      .single();
+      
+    if (error) throw error;
+    return res.json(pool);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

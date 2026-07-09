@@ -1,9 +1,12 @@
 import express from 'express';
-import { createPool, joinPool, contribute, payout, getPoolState } from '../controllers/poolController.js';
+import { createPool, joinPool, contribute, payout, getPoolState, getAllPools, getMyPools, getPoolById } from '../controllers/poolController.js';
 import { register, verifyOtp, resendOtp, login, verifyLoginOtp, refreshSession } from '../controllers/authController.js';
 
 const router = express.Router();
 
+router.get('/pools', getAllPools);
+router.get('/pools/user/:userId', getMyPools);
+router.get('/pools/:poolId', getPoolById);
 router.post('/pools', createPool);
 router.post('/pools/:poolId/join', joinPool);
 router.post('/pools/:poolId/contribute', contribute);
