@@ -11,10 +11,12 @@ import {
   networkPassphrase,
   PHP_TOKEN_CODE,
   PHP_TOKEN_ISSUER,
+  PHP_TOKEN_ADDRESS,
 } from "../config/stellar.js";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.js";
 import crypto from "crypto";
+import { invokeOp } from "../utils/stellar.js";
 
 // --------------------------------------------------------------
 // Encryption helpers (AES-256-CBC)

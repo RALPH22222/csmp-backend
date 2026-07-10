@@ -11,3 +11,4 @@ export const PHP_TOKEN_CODE = process.env.PHP_TOKEN_CODE;
 export const PHP_TOKEN_ISSUER = process.env.PHP_TOKEN_ISSUER;
 export const PHP_TOKEN_ISSUER_SECRET = process.env.PHP_TOKEN_ISSUER_SECRET;
 export const PHP_DECIMALS = 7;
+export const PALUWAGAN_CONTRACT_ADDRESS = process.env.PALUWAGAN_CONTRACT_ADDRESS;

@@ -12,6 +12,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+import { startCronJobs } from './cron/autoDeduct.js';
+startCronJobs();
+
 app.use('/api', apiRoutes);
 app.get('/', (req, res) => {
     res.send('CSMP Backend is running!');
