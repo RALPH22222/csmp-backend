@@ -43,6 +43,10 @@ export const createPool = async (req, res) => {
       return res.status(403).json({ error: "Insufficient credit score. A minimum score of 500 is required to create a pool." });
     }
 
+    if (!userData.stellar_public_key) {
+      return res.status(400).json({ error: "User does not have a Stellar wallet. Please set up a wallet first." });
+    }
+
     const contribution_amount = max_members > 0 ? total_payout_amount / max_members : 0;
 
     const { data: pool, error } = await supabase
@@ -134,14 +138,20 @@ export const joinPool = async (req, res) => {
       .single();
     if (userErr) throw userErr;
 
-    // On-chain call FIRST — don't touch Supabase until this succeeds
-    await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, "add_member", [
-        scArg(poolId, "string"),
-        userRecord.stellar_public_key,
-        scArg(sequence, "u32"),
-      ]),
-    ]);
+    if (pool.soroban_contract_address) {
+      if (!userRecord.stellar_public_key) {
+        return res.status(400).json({ error: "User does not have a Stellar wallet address. Please create a wallet first." });
+      }
+
+      // On-chain call FIRST — don't touch Supabase until this succeeds
+      await buildAndSubmit([
+        invokeOp(pool.soroban_contract_address, "add_member", [
+          scArg(poolId, "string"),
+          userRecord.stellar_public_key,
+          scArg(sequence, "u32"),
+        ]),
+      ]);
+    }
 
     // Only insert into Supabase after chain success
     const { data: member, error: memberErr } = await supabase
@@ -156,21 +166,7 @@ export const joinPool = async (req, res) => {
       .single();
     if (memberErr) throw memberErr;
 
-    const { data: userRecord, error: userErr } = await supabase
-      .from('users')
-      .select('stellar_public_key')
-      .eq('id', user_id)
-      .single();
-    if (userErr) throw userErr;
-
-    await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'add_member', [
-        scArg(poolId, 'string'),
-        userRecord.stellar_public_key,
-        scArg(sequence, 'u32'),
-      ]),
-    ]);
-
+    // removed duplicate add_member call
     // Check if max members reached, if so, set pool status to ACTIVE (2)
     const { count, error: countErr } = await supabase
       .from('pool_members')
@@ -201,6 +197,10 @@ export const contribute = async (req, res) => {
       .eq("id", poolId)
       .single();
     if (poolErr) throw poolErr;
+
+    if (!pool.soroban_contract_address) {
+      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
+    }
 
     const { data: member, error: memberErr } = await supabase
       .from("pool_members")
@@ -279,6 +279,10 @@ export const payout = async (req, res) => {
       .single();
     if (error) throw error;
 
+    if (!pool.soroban_contract_address) {
+      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
+    }
+
     await buildAndSubmit([
       invokeOp(pool.soroban_contract_address, "payout", [
         scArg(poolId, "string"),
@@ -300,6 +304,10 @@ export const getPoolState = async (req, res) => {
       .eq("id", poolId)
       .single();
     if (error) throw error;
+
+    if (!pool.soroban_contract_address) {
+      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
+    }
 
     const rawState = await buildAndSubmit([
       invokeOp(pool.soroban_contract_address, "get_pool_state", [

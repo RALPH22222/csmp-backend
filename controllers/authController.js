@@ -473,6 +473,7 @@ export const login = async (req, res) => {
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
 
+    console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${otp}`)
     await sendOtpSms(mobilePhone, otp);
 
     return res.status(200).json({

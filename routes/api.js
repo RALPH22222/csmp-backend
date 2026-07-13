@@ -4,7 +4,7 @@ import { register, verifyOtp, resendOtp, login, verifyLoginOtp, refreshSession }
 
 const router = express.Router();
 
-router.get('/pools', getAllPools);
+router.get('c', getAllPools);
 router.get('/pools/user/:userId', getMyPools);
 router.get('/pools/:poolId', getPoolById);
 router.post('/pools', createPool);
