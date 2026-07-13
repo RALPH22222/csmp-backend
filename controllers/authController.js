@@ -334,6 +334,7 @@ export const verifyOtp = async (req, res) => {
       signInError &&
       signInError.message.includes("Phone logins are disabled")
     ) {
+      // In your authController.js login function
       const token = jwt.sign(
         {
           aud: "authenticated",
@@ -345,7 +346,7 @@ export const verifyOtp = async (req, res) => {
           user_metadata: {},
           role: "authenticated",
         },
-        process.env.JWT_SECRET || "fallback_secret_key",
+        process.env.JWT_SECRET, // Remove the fallback, use ONLY the env variable
       );
 
       sessionData = {
@@ -408,16 +409,14 @@ export const login = async (req, res) => {
       if (userProfile) {
         const token = jwt.sign(
           {
+            id: userProfile.auth_id, // Make sure this matches what middleware expects
             aud: "authenticated",
             exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
             sub: userProfile.auth_id,
-            email: "",
             phone: formattedPhone,
-            app_metadata: { provider: "phone", providers: ["phone"] },
-            user_metadata: {},
             role: "authenticated",
           },
-          process.env.JWT_SECRET || "fallback_secret_key",
+          process.env.JWT_SECRET || "fallback_secret_key"
         );
 
         sessionData = {
@@ -448,12 +447,22 @@ export const login = async (req, res) => {
       });
     }
 
+    // Get the user profile
     const { data: userProfile, error: userError } = await supabase
       .from("users")
       .select("*")
       .eq("auth_id", sessionData.user.id)
       .single();
 
+    if (userError) {
+      console.error("User profile fetch error:", userError.message);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch user profile",
+      });
+    }
+
+    // If returning user, return directly
     if (isReturningUser) {
       return res.status(200).json({
         success: true,
@@ -464,7 +473,12 @@ export const login = async (req, res) => {
       });
     }
 
+    // Generate OTP for new login
     const otp = generateOTP();
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`🔑 [DEV] Login OTP for ${mobilePhone}: ${otp}`);
+    }
 
     loginOtpStore.set(mobilePhone, {
       otp,

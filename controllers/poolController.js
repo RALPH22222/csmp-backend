@@ -1,18 +1,38 @@
-import { supabase } from "../config/supabase.js";
-import { PHP_TOKEN_ADDRESS, PALUWAGAN_CONTRACT_ADDRESS } from "../config/stellar.js";
+import bcrypt from "bcrypt";
 import {
-  invokeOp,
-  toTokenUnits,
-  buildAndSubmit,
-  submitUserOp,
-  scArg,
-} from "../utils/stellar.js";
-import { Keypair, scValToNative } from "@stellar/stellar-sdk";
+  Keypair,
+  Asset,
+  Operation,
+  TransactionBuilder,
+  BASE_FEE,
+} from "@stellar/stellar-sdk";
+import {
+  stellarRpc,
+  networkPassphrase,
+  PHP_TOKEN_CODE,
+  PHP_TOKEN_ISSUER,
+  PHP_TOKEN_ADDRESS,
+} from "../config/stellar.js";
+import jwt from "jsonwebtoken";
+import { supabase } from "../config/supabase.js";
 import crypto from "crypto";
+import { invokeOp } from "../utils/stellar.js";
 
+// --------------------------------------------------------------
+// Encryption helpers (AES-256-CBC)
+// --------------------------------------------------------------
 const ENCRYPTION_KEY = process.env.JWT_SECRET
   ? crypto.scryptSync(process.env.JWT_SECRET, "salt", 32)
   : crypto.scryptSync("fallback_secret_key", "salt", 32);
+const IV_LENGTH = 16;
+
+const encryptText = (text) => {
+  const iv = crypto.randomBytes(IV_LENGTH);
+  const cipher = crypto.createCipheriv("aes-256-cbc", ENCRYPTION_KEY, iv);
+  let encrypted = cipher.update(text, "utf8", "hex");
+  encrypted += cipher.final("hex");
+  return iv.toString("hex") + ":" + encrypted;
+};
 
 const decryptText = (text) => {
   const textParts = text.split(":");
@@ -24,370 +44,557 @@ const decryptText = (text) => {
   return decrypted;
 };
 
-export const createPool = async (req, res) => {
+// --------------------------------------------------------------
+// OTP store and helpers
+// --------------------------------------------------------------
+const otpStore = new Map();
+const loginOtpStore = new Map();
+
+const generateOTP = () =>
+  Math.floor(100000 + Math.random() * 900000).toString();
+
+const formatE164 = (phone) => {
+  let digits = phone.replace(/\D/g, "");
+  if (digits.startsWith("63")) return digits;
+  if (digits.startsWith("09")) return "63" + digits.substring(1);
+  if (digits.startsWith("9")) return "63" + digits;
+  return digits;
+};
+
+const sendOtpSms = async (mobilePhone, otp) => {
   try {
-    let { name, total_members, total_payout_amount, cycle_duration_days, max_members, organizer_id, join_as_member } = req.body;
-    
-    // Validate credit score
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('did_credit_score, stellar_public_key')
-      .eq('id', organizer_id)
-      .single();
-      
-    if (userError || !userData) {
-      return res.status(400).json({ error: "Could not fetch user data." });
-    }
-    
-    if (userData.did_credit_score < 500) {
-      return res.status(403).json({ error: "Insufficient credit score. A minimum score of 500 is required to create a pool." });
-    }
+    const formattedPhone = formatE164(mobilePhone);
+    const apiPhone = "+" + formattedPhone;
+    console.log(`📡 Sending OTP to ${apiPhone}`);
 
-    if (!userData.stellar_public_key) {
-      return res.status(400).json({ error: "User does not have a Stellar wallet. Please set up a wallet first." });
-    }
-
-    const contribution_amount = max_members > 0 ? total_payout_amount / max_members : 0;
-
-    const { data: pool, error } = await supabase
-      .from("pools")
-      .insert({
-        pool_name: name,
-        pool_status_id: 5, // PENDING
-        total_payout_amount: total_payout_amount,
-        cycle_contribution_amount: contribution_amount,
-        cycle_duration_days,
-        max_members,
-        soroban_contract_address: PALUWAGAN_CONTRACT_ADDRESS,
-        organizer_id: organizer_id,
-      })
-      .select()
-      .single();
-    if (error) throw error;
-
-    try {
-      await buildAndSubmit([
-        invokeOp(PALUWAGAN_CONTRACT_ADDRESS, 'create_pool', [
-          scArg(pool.id, 'string'),
-          scArg(total_members, 'u32'),
-          scArg(toTokenUnits(contribution_amount), 'i128'),
-          PHP_TOKEN_ADDRESS,
-        ]),
-      ]);
-    } catch (err) {
-      console.warn('Skipping smart contract create_pool:', err.message);
-    }
-
-    const { data: existingMember } = await supabase
-      .from('pool_members')
-      .select('*')
-      .eq('pool_id', pool.id)
-      .eq('user_id', organizer_id)
-      .single();
-
-    if (join_as_member) {
-      const sequence = 1;
-      
-      if (!existingMember) {
-        const { error: memberErr } = await supabase
-          .from('pool_members')
-          .insert({
-            pool_id: pool.id,
-            user_id: organizer_id,
-            member_status_id: 1,
-            payout_sequence_number: sequence,
-          });
-        if (memberErr) throw memberErr;
-      }
-
-      try {
-        await buildAndSubmit([
-          invokeOp(PALUWAGAN_CONTRACT_ADDRESS, 'add_member', [
-            scArg(pool.id, 'string'),
-            userData.stellar_public_key,
-            scArg(sequence, 'u32'),
-          ]),
-        ]);
-      } catch (err) {
-        console.warn('Skipping smart contract add_member:', err.message);
-      }
-    }
-
-    return res.status(201).json(pool);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    const response = await fetch(
+      "https://smsapiph.onrender.com/api/v1/send/sms",
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": process.env.SMSkey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          recipient: apiPhone,
+          message: `Your CSMP verification code is ${otp}`,
+        }),
+      },
+    );
+    const data = await response.json();
+    console.log("SMS API Response:", data);
+  } catch (error) {
+    console.error("Failed to send SMS:", error);
   }
 };
 
-export const joinPool = async (req, res) => {
+// --------------------------------------------------------------
+// Helper: set up user's Stellar account (fund + trustline)
+// --------------------------------------------------------------
+async function setupUserStellarAccount(publicKey, secretKey) {
   try {
-    const { poolId } = req.params;
-    const { user_id, sequence } = req.body;
-
-    const { data: pool, error: poolErr } = await supabase.from('pools').select('*').eq('id', poolId).single();
-    if (poolErr || !pool) return res.status(404).json({ error: 'Pool not found' });
-    
-    if (pool.pool_status_id !== 1) { // 1 = FORMING
-      return res.status(400).json({ error: 'This pool is not currently accepting members' });
+    console.log(`💧 Funding ${publicKey} via Friendbot...`);
+    const fundRes = await fetch(
+      `https://friendbot-futurenet.stellar.org?addr=${publicKey}`,
+    );
+    const fundData = await fundRes.json();
+    if (!fundData.successful) {
+      console.error(`Friendbot funding failed for ${publicKey}`);
+      return;
     }
 
-    const { data: userRecord, error: userErr } = await supabase
+    console.log(`🔗 Adding PHP trustline for ${publicKey}...`);
+    const keypair = Keypair.fromSecret(secretKey);
+    const asset = new Asset(PHP_TOKEN_CODE, PHP_TOKEN_ISSUER);
+    const sourceAccount = await stellarRpc.getAccount(publicKey);
+
+    let tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase,
+    })
+      .addOperation(Operation.changeTrust({ asset }))
+      .setTimeout(30)
+      .build();
+
+    tx.sign(keypair);
+    const sendResp = await stellarRpc.sendTransaction(tx);
+    if (sendResp.status !== "PENDING") {
+      console.error("Trustline send failed:", sendResp);
+      return;
+    }
+
+    let txResp;
+    while (true) {
+      await new Promise((r) => setTimeout(r, 1000));
+      txResp = await stellarRpc.getTransaction(sendResp.hash);
+      if (txResp.status === "SUCCESS") break;
+      if (txResp.status === "FAILED") {
+        console.error("Trustline transaction failed:", txResp);
+        return;
+      }
+    }
+    console.log(`✅ Stellar account ready for ${publicKey}`);
+  } catch (err) {
+    console.error("Stellar setup error:", err);
+  }
+}
+
+// --------------------------------------------------------------
+// REGISTER
+// --------------------------------------------------------------
+export const register = async (req, res) => {
+  try {
+    const {
+      mobilePhone,
+      firstName,
+      middleName,
+      lastName,
+      dateOfBirth,
+      sex,
+      password,
+    } = req.body;
+
+    if (!mobilePhone || !firstName || !lastName || !password) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing required fields" });
+    }
+
+    // Check if user already exists
+    const { data: existingUser } = await supabase
       .from("users")
-      .select("stellar_public_key")
-      .eq("id", user_id)
+      .select("id")
+      .eq("phone_number", mobilePhone)
       .single();
-    if (userErr) throw userErr;
 
-    if (pool.soroban_contract_address) {
-      if (!userRecord.stellar_public_key) {
-        return res.status(400).json({ error: "User does not have a Stellar wallet address. Please create a wallet first." });
-      }
-
-      // On-chain call FIRST — don't touch Supabase until this succeeds
-      await buildAndSubmit([
-        invokeOp(pool.soroban_contract_address, "add_member", [
-          scArg(poolId, "string"),
-          userRecord.stellar_public_key,
-          scArg(sequence, "u32"),
-        ]),
-      ]);
+    if (existingUser) {
+      return res
+        .status(409)
+        .json({ success: false, message: "Phone number already registered" });
     }
 
-    // Only insert into Supabase after chain success
-    const { data: member, error: memberErr } = await supabase
-      .from("pool_members")
-      .insert({
-        pool_id: poolId,
-        user_id,
-        member_status_id: 1,
-        payout_sequence_number: sequence,
-      })
+    const otp = generateOTP();
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${otp}`);
+    }
+
+    // Generate a new Stellar wallet for the user
+    const keypair = Keypair.random();
+    const stellarPublicKey = keypair.publicKey();
+    const stellarSecretKey = keypair.secret();
+
+    // Store user payload temporarily with OTP
+    otpStore.set(mobilePhone, {
+      otp,
+      password: encryptText(password),
+      stellarSecretKey,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      userData: {
+        phone_number: mobilePhone,
+        first_name: firstName,
+        middle_name: middleName || null,
+        last_name: lastName,
+        date_of_birth: new Date(dateOfBirth).toISOString().split("T")[0],
+        sex,
+        stellar_public_key: stellarPublicKey,
+      },
+    });
+
+    await sendOtpSms(mobilePhone, otp);
+
+    return res.status(200).json({
+      success: true,
+      message: "OTP sent successfully.",
+    });
+  } catch (error) {
+    console.error("Registration Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// --------------------------------------------------------------
+// VERIFY OTP (Registration)
+// --------------------------------------------------------------
+export const verifyOtp = async (req, res) => {
+  try {
+    const { mobilePhone, otp } = req.body;
+
+    if (!mobilePhone || !otp) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Phone and OTP are required" });
+    }
+
+    const record = otpStore.get(mobilePhone);
+
+    if (!record) {
+      return res
+        .status(404)
+        .json({ success: false, message: "OTP not found or expired" });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(mobilePhone);
+      return res
+        .status(400)
+        .json({ success: false, message: "OTP has expired" });
+    }
+
+    if (record.otp !== otp) {
+      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    }
+
+    // Create user in Supabase Auth to get auth_id
+    const formattedPhone = formatE164(mobilePhone);
+    let authUserId;
+
+    const { data: createData, error: authError } =
+      await supabase.auth.admin.createUser({
+        phone: formattedPhone,
+        password: decryptText(record.password),
+        phone_confirm: true,
+      });
+
+    if (authError) {
+      if (authError.message.includes("already registered")) {
+        let { data: signInData, error: signInError } =
+          await supabase.auth.signInWithPassword({
+            phone: formattedPhone,
+            password: decryptText(record.password),
+          });
+
+        if (
+          signInError &&
+          signInError.message.includes("Phone logins are disabled")
+        ) {
+          const { data: stuckUser } = await supabase
+            .from("users")
+            .select("auth_id")
+            .eq("phone_number", mobilePhone)
+            .single();
+          if (stuckUser) {
+            signInData = { user: { id: stuckUser.auth_id } };
+            signInError = null;
+          }
+        }
+
+        if (signInData && signInData.user) {
+          authUserId = signInData.user.id;
+        } else {
+          throw new Error(
+            "Phone number is stuck in Supabase Auth. Please delete it manually from the dashboard.",
+          );
+        }
+      } else {
+        throw new Error(`Auth Error: ${authError.message}`);
+      }
+    } else {
+      authUserId = createData.user.id;
+    }
+
+    record.userData.auth_id = authUserId;
+
+    // Insert into public.users
+    const { data: newUser, error: dbError } = await supabase
+      .from("users")
+      .insert([record.userData])
       .select()
       .single();
-    if (memberErr) throw memberErr;
 
-    // removed duplicate add_member call
-    // Check if max members reached, if so, set pool status to ACTIVE (2)
-    const { count, error: countErr } = await supabase
-      .from('pool_members')
-      .select('*', { count: 'exact', head: true })
-      .eq('pool_id', poolId);
-      
-    if (!countErr && count >= pool.max_members) {
-      await supabase
-        .from('pools')
-        .update({ pool_status_id: 2 }) // ACTIVE
-        .eq('id', poolId);
+    if (dbError) {
+      await supabase.auth.admin.deleteUser(authUserId);
+      throw new Error(`DB Error: ${dbError.message}`);
     }
 
-    return res.status(201).json(member);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-};
+    // Store the encrypted Stellar secret
+    const encryptedSecret = encryptText(record.stellarSecretKey);
+    await supabase
+      .from("users")
+      .update({ stellar_secret: encryptedSecret })
+      .eq("id", newUser.id);
 
-export const contribute = async (req, res) => {
-  try {
-    const { poolId } = req.params;
-    const { user_id } = req.body;
+    // Fire-and-forget: fund the account and create trustline
+    setupUserStellarAccount(
+      record.userData.stellar_public_key,
+      record.stellarSecretKey,
+    ).catch((err) => console.error("Stellar setup error:", err));
 
-    const { data: pool, error: poolErr } = await supabase
-      .from("pools")
-      .select("*")
-      .eq("id", poolId)
-      .single();
-    if (poolErr) throw poolErr;
+    // Clean up OTP store
+    otpStore.delete(mobilePhone);
 
-    if (!pool.soroban_contract_address) {
-      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
+    // Sign in the user to return a session
+    let { data: sessionData, error: signInError } =
+      await supabase.auth.signInWithPassword({
+        phone: formattedPhone,
+        password: decryptText(record.password),
+      });
+
+    if (
+      signInError &&
+      signInError.message.includes("Phone logins are disabled")
+    ) {
+      const token = jwt.sign(
+        {
+          aud: "authenticated",
+          exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
+          sub: authUserId,
+          email: "",
+          phone: formattedPhone,
+          app_metadata: { provider: "phone", providers: ["phone"] },
+          user_metadata: {},
+          role: "authenticated",
+        },
+        process.env.JWT_SECRET || "fallback_secret_key",
+      );
+
+      sessionData = {
+        session: {
+          access_token: token,
+          refresh_token: token,
+          expires_in: 86400,
+          token_type: "bearer",
+          user: { id: authUserId, phone: formattedPhone },
+        },
+        user: { id: authUserId, phone: formattedPhone },
+      };
+      signInError = null;
     }
 
-    const { data: member, error: memberErr } = await supabase
-      .from("pool_members")
-      .select("*, users(stellar_public_key, stellar_secret)")
-      .eq("pool_id", poolId)
-      .eq("user_id", user_id)
-      .single();
-    if (memberErr || !member) return res.status(400).json({ error: 'Not a member' });
-
-    // Fetch total members to calculate dynamic contribution
-    const { count, error: countErr } = await supabase
-      .from('pool_members')
-      .select('*', { count: 'exact', head: true })
-      .eq('pool_id', poolId);
-      
-    if (countErr) throw countErr;
-    
-    const currentMembers = count || 1;
-    const dynamicContribution = pool.total_payout_amount / currentMembers;
-
-    const contractAddress = pool.soroban_contract_address;
-    const memberAddr = member.users.stellar_public_key;
-    const encryptedSecret = member.users.stellar_secret;
-    if (!encryptedSecret)
-      return res.status(400).json({ error: "User secret not available" });
-
-    const userSecret = decryptText(encryptedSecret);
-    const userKeypair = Keypair.fromSecret(userSecret);
-    const amountUnits = toTokenUnits(dynamicContribution);
-
-    // Soroban allows only one invokeHostFunction op per tx — send as two.
-    await submitUserOp(
-      memberAddr,
-      userKeypair,
-      invokeOp(PHP_TOKEN_ADDRESS, "transfer", [
-        memberAddr,
-        contractAddress,
-        scArg(amountUnits, "i128"),
-      ]),
-    );
-
-    await submitUserOp(
-      memberAddr,
-      userKeypair,
-      invokeOp(contractAddress, "contribute", [
-        scArg(poolId, "string"),
-        memberAddr,
-      ]),
-    );
-
-    await supabase.from("transactions").insert({
-      pool_member_id: member.id,
-      transaction_type_id: 1,
-      transaction_status_id: 2,
-      amount: dynamicContribution,
+    return res.status(201).json({
+      success: true,
+      message: "Registration successful",
+      session: sessionData?.session || null,
+      token: sessionData?.session?.access_token || null,
+      user: newUser,
     });
-
-    await supabase.rpc("increment_contribution", {
-      member_id: member.id,
-      amount: dynamicContribution,
-    });
-
-    return res.json({ success: true });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error("OTP Verification Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-export const payout = async (req, res) => {
+// --------------------------------------------------------------
+// LOGIN, VERIFY LOGIN OTP, REFRESH, RESEND OTP
+// --------------------------------------------------------------
+export const login = async (req, res) => {
   try {
-    const { poolId } = req.params;
-    const { data: pool, error } = await supabase
-      .from("pools")
-      .select("*")
-      .eq("id", poolId)
-      .single();
-    if (error) throw error;
+    const { mobilePhone, password, isReturningUser } = req.body;
 
-    if (!pool.soroban_contract_address) {
-      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
+    if (!mobilePhone || !password) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Phone and password are required" });
     }
 
-    await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, "payout", [
-        scArg(poolId, "string"),
-      ]),
-    ]);
+    const formattedPhone = formatE164(mobilePhone);
 
-    return res.json({ success: true });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-};
+    let { data: sessionData, error: signInError } =
+      await supabase.auth.signInWithPassword({
+        phone: formattedPhone,
+        password,
+      });
 
-export const getPoolState = async (req, res) => {
-  try {
-    const { poolId } = req.params;
-    const { data: pool, error } = await supabase
-      .from("pools")
-      .select("soroban_contract_address")
-      .eq("id", poolId)
-      .single();
-    if (error) throw error;
+    if (
+      signInError &&
+      signInError.message.includes("Phone logins are disabled")
+    ) {
+      const { data: userProfile } = await supabase
+        .from("users")
+        .select("auth_id")
+        .eq("phone_number", mobilePhone)
+        .single();
 
-    if (!pool.soroban_contract_address) {
-      return res.status(400).json({ error: 'This pool is not fully initialized (missing contract address)' });
-    }
+      if (userProfile) {
+        const token = jwt.sign(
+          {
+            aud: "authenticated",
+            exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
+            sub: userProfile.auth_id,
+            email: "",
+            phone: formattedPhone,
+            app_metadata: { provider: "phone", providers: ["phone"] },
+            user_metadata: {},
+            role: "authenticated",
+          },
+          process.env.JWT_SECRET || "fallback_secret_key",
+        );
 
-    const rawState = await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, "get_pool_state", [
-        scArg(poolId, "string"),
-      ]),
-    ]);
-
-    const state = JSON.parse(
-      JSON.stringify(scValToNative(rawState), (_, v) =>
-        typeof v === "bigint" ? v.toString() : v,
-      ),
-    );
-    return res.json(state);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-};
-
-export const getAllPools = async (req, res) => {
-  try {
-    const { data: pools, error } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name)')
-      .in('pool_status_id', [1, 3]);
-    
-    if (error) throw error;
-    return res.json(pools);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-};
-
-export const getMyPools = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    
-    // Fetch pools where the user is a member
-    const { data: members, error: membersErr } = await supabase
-      .from('pool_members')
-      .select('pool_id, pools(*, pool_statuses(status_name))')
-      .eq('user_id', userId);
-      
-    if (membersErr) throw membersErr;
-
-    // Fetch pools where the user is the organizer
-    const { data: organized, error: organizedErr } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name)')
-      .eq('organizer_id', userId);
-
-    if (organizedErr) throw organizedErr;
-
-    const myPools = members.map(m => m.pools);
-    
-    // Merge organized pools, avoiding duplicates
-    const existingPoolIds = new Set(myPools.map(p => p.id));
-    for (const pool of organized) {
-      if (!existingPoolIds.has(pool.id)) {
-        myPools.push(pool);
+        sessionData = {
+          session: {
+            access_token: token,
+            refresh_token: token,
+            expires_in: 86400,
+            token_type: "bearer",
+            user: { id: userProfile.auth_id, phone: formattedPhone },
+          },
+          user: { id: userProfile.auth_id, phone: formattedPhone },
+        };
+        signInError = null;
+      } else {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Auth Error: Invalid login credentials or user not registered.",
+        });
       }
     }
 
-    return res.json(myPools);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    if (signInError) {
+      console.error("Supabase Login Error:", signInError.message);
+      return res.status(401).json({
+        success: false,
+        message: `Auth Error: ${signInError.message}`,
+      });
+    }
+
+    const { data: userProfile, error: userError } = await supabase
+      .from("users")
+      .select("*")
+      .eq("auth_id", sessionData.user.id)
+      .single();
+
+    if (isReturningUser) {
+      return res.status(200).json({
+        success: true,
+        message: "Login successful",
+        session: sessionData.session,
+        token: sessionData.session.access_token,
+        user: userProfile,
+      });
+    }
+
+    const otp = generateOTP();
+
+    loginOtpStore.set(mobilePhone, {
+      otp,
+      sessionData,
+      userProfile,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${otp}`)
+    await sendOtpSms(mobilePhone, otp);
+
+    return res.status(200).json({
+      success: true,
+      requireOtp: true,
+      message: "OTP sent for login verification",
+    });
+  } catch (error) {
+    console.error("Login Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-export const getPoolById = async (req, res) => {
+export const verifyLoginOtp = async (req, res) => {
   try {
-    const { poolId } = req.params;
-    const { data: pool, error } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name), pool_members(*, users(first_name, last_name), member_statuses(status_name))')
-      .eq('id', poolId)
-      .single();
-      
-    if (error) throw error;
-    return res.json(pool);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    const { mobilePhone, otp } = req.body;
+
+    if (!mobilePhone || !otp) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Phone and OTP are required" });
+    }
+
+    const record = loginOtpStore.get(mobilePhone);
+
+    if (!record) {
+      return res
+        .status(404)
+        .json({ success: false, message: "OTP not found or expired" });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      loginOtpStore.delete(mobilePhone);
+      return res
+        .status(400)
+        .json({ success: false, message: "OTP has expired" });
+    }
+
+    if (record.otp !== otp) {
+      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    }
+
+    loginOtpStore.delete(mobilePhone);
+
+    return res.status(200).json({
+      success: true,
+      message: "Login successful",
+      session: record.sessionData.session,
+      token: record.sessionData.session.access_token,
+      user: record.userProfile,
+    });
+  } catch (error) {
+    console.error("Login OTP Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const refreshSession = async (req, res) => {
+  try {
+    const { refresh_token } = req.body;
+    if (!refresh_token) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Refresh token is required" });
+    }
+
+    const { data, error } = await supabase.auth.refreshSession({
+      refresh_token,
+    });
+
+    if (error) {
+      return res.status(401).json({ success: false, message: error.message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      session: data.session,
+      token: data.session.access_token,
+    });
+  } catch (error) {
+    console.error("Refresh Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const resendOtp = async (req, res) => {
+  try {
+    const { mobilePhone } = req.body;
+
+    if (!mobilePhone) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Phone number is required" });
+    }
+
+    const record = otpStore.get(mobilePhone);
+    if (!record) {
+      return res.status(404).json({
+        success: false,
+        message: "User session not found. Please restart registration.",
+      });
+    }
+
+    const newOtp = generateOTP();
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${newOtp}`);
+    }
+
+    otpStore.set(mobilePhone, {
+      ...record,
+      otp: newOtp,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    await sendOtpSms(mobilePhone, newOtp);
+
+    return res
+      .status(200)
+      .json({ success: true, message: "OTP resent successfully." });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
