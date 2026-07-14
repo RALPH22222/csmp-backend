@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="https://raw.githubusercontent.com/RALPH22222/csmp-web-admin/main/public/logo.png" width="80" alt="BayanIpon Logo" />
   <h1>BayanIpon - Backend API & Services</h1>
   <p><strong>The Bridge Between Web2 and Web3</strong></p>
 </div>
