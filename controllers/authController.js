@@ -208,16 +208,16 @@ export const register = async (req, res) => {
 
     if (authError) {
       console.error("Supabase auth.signUp error:", authError);
-      return res.status(400).json({ success: false, message: authError.message || authError });
+      return res.status(400).json({ success: false, message: "AUTH_ERROR: " + JSON.stringify(authError) + " msg: " + authError.message });
     }
 
     return res.status(200).json({
       success: true,
-      message: "OTP sent successfully.",
+      message: "OTP sent successfully via email.",
     });
   } catch (error) {
     console.error("Registration Error caught in try-catch:", error);
-    return res.status(500).json({ success: false, message: error.message || error });
+    return res.status(500).json({ success: false, message: "CATCH_ERROR: " + JSON.stringify(error, Object.getOwnPropertyNames(error)) + " | " + String(error) });
   }
 };
 
