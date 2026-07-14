@@ -1,5 +1,8 @@
 import { supabase } from "../config/supabase.js";
-import { PHP_TOKEN_ADDRESS, PALUWAGAN_CONTRACT_ADDRESS } from "../config/stellar.js";
+import {
+  PHP_TOKEN_ADDRESS,
+  PALUWAGAN_CONTRACT_ADDRESS,
+} from "../config/stellar.js";
 import {
   invokeOp,
   toTokenUnits,
@@ -26,24 +29,38 @@ const decryptText = (text) => {
 
 export const createPool = async (req, res) => {
   try {
-    let { name, total_members, total_payout_amount, cycle_duration_days, max_members, organizer_id, join_as_member } = req.body;
-    
+    let {
+      name,
+      total_members,
+      total_payout_amount,
+      cycle_duration_days,
+      max_members,
+      organizer_id,
+      join_as_member,
+    } = req.body;
+
     // Validate credit score
     const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('did_credit_score, stellar_public_key')
-      .eq('id', organizer_id)
+      .from("users")
+      .select("did_credit_score, stellar_public_key")
+      .eq("id", organizer_id)
       .single();
-      
+
     if (userError || !userData) {
       return res.status(400).json({ error: "Could not fetch user data." });
     }
-    
+
     if (userData.did_credit_score < 500) {
-      return res.status(403).json({ error: "Insufficient credit score. A minimum score of 500 is required to create a pool." });
+      return res
+        .status(403)
+        .json({
+          error:
+            "Insufficient credit score. A minimum score of 500 is required to create a pool.",
+        });
     }
 
-    const contribution_amount = max_members > 0 ? total_payout_amount / max_members : 0;
+    const contribution_amount =
+      max_members > 0 ? total_payout_amount / max_members : 0;
 
     const { data: pool, error } = await supabase
       .from("pools")
@@ -63,30 +80,30 @@ export const createPool = async (req, res) => {
 
     try {
       await buildAndSubmit([
-        invokeOp(PALUWAGAN_CONTRACT_ADDRESS, 'create_pool', [
-          scArg(pool.id, 'string'),
-          scArg(total_members, 'u32'),
-          scArg(toTokenUnits(contribution_amount), 'i128'),
+        invokeOp(PALUWAGAN_CONTRACT_ADDRESS, "create_pool", [
+          scArg(pool.id, "string"),
+          scArg(total_members, "u32"),
+          scArg(toTokenUnits(contribution_amount), "i128"),
           PHP_TOKEN_ADDRESS,
         ]),
       ]);
     } catch (err) {
-      console.warn('Skipping smart contract create_pool:', err.message);
+      console.warn("Skipping smart contract create_pool:", err.message);
     }
 
     const { data: existingMember } = await supabase
-      .from('pool_members')
-      .select('*')
-      .eq('pool_id', pool.id)
-      .eq('user_id', organizer_id)
+      .from("pool_members")
+      .select("*")
+      .eq("pool_id", pool.id)
+      .eq("user_id", organizer_id)
       .single();
 
     if (join_as_member) {
       const sequence = 1;
-      
+
       if (!existingMember) {
         const { error: memberErr } = await supabase
-          .from('pool_members')
+          .from("pool_members")
           .insert({
             pool_id: pool.id,
             user_id: organizer_id,
@@ -98,14 +115,14 @@ export const createPool = async (req, res) => {
 
       try {
         await buildAndSubmit([
-          invokeOp(PALUWAGAN_CONTRACT_ADDRESS, 'add_member', [
-            scArg(pool.id, 'string'),
+          invokeOp(PALUWAGAN_CONTRACT_ADDRESS, "add_member", [
+            scArg(pool.id, "string"),
             userData.stellar_public_key,
-            scArg(sequence, 'u32'),
+            scArg(sequence, "u32"),
           ]),
         ]);
       } catch (err) {
-        console.warn('Skipping smart contract add_member:', err.message);
+        console.warn("Skipping smart contract add_member:", err.message);
       }
     }
 
@@ -120,13 +137,22 @@ export const joinPool = async (req, res) => {
     const { poolId } = req.params;
     const { user_id, sequence } = req.body;
 
-    const { data: pool, error: poolErr } = await supabase.from('pools').select('*').eq('id', poolId).single();
-    if (poolErr || !pool) return res.status(404).json({ error: 'Pool not found' });
-    
-    if (pool.pool_status_id !== 1) { // 1 = FORMING
-      return res.status(400).json({ error: 'This pool is not currently accepting members' });
+    const { data: pool, error: poolErr } = await supabase
+      .from("pools")
+      .select("*")
+      .eq("id", poolId)
+      .single();
+    if (poolErr || !pool)
+      return res.status(404).json({ error: "Pool not found" });
+
+    if (pool.pool_status_id !== 1) {
+      // not FORMING
+      return res
+        .status(400)
+        .json({ error: "This pool is not currently accepting members" });
     }
 
+    // Fetch user’s Stellar key
     const { data: userRecord, error: userErr } = await supabase
       .from("users")
       .select("stellar_public_key")
@@ -134,7 +160,7 @@ export const joinPool = async (req, res) => {
       .single();
     if (userErr) throw userErr;
 
-    // On-chain call FIRST — don't touch Supabase until this succeeds
+    // On-chain call FIRST
     await buildAndSubmit([
       invokeOp(pool.soroban_contract_address, "add_member", [
         scArg(poolId, "string"),
@@ -143,7 +169,7 @@ export const joinPool = async (req, res) => {
       ]),
     ]);
 
-    // Only insert into Supabase after chain success
+    // Insert into pool_members
     const { data: member, error: memberErr } = await supabase
       .from("pool_members")
       .insert({
@@ -156,32 +182,17 @@ export const joinPool = async (req, res) => {
       .single();
     if (memberErr) throw memberErr;
 
-    const { data: userRecord, error: userErr } = await supabase
-      .from('users')
-      .select('stellar_public_key')
-      .eq('id', user_id)
-      .single();
-    if (userErr) throw userErr;
-
-    await buildAndSubmit([
-      invokeOp(pool.soroban_contract_address, 'add_member', [
-        scArg(poolId, 'string'),
-        userRecord.stellar_public_key,
-        scArg(sequence, 'u32'),
-      ]),
-    ]);
-
-    // Check if max members reached, if so, set pool status to ACTIVE (2)
+    // Check if pool is now full
     const { count, error: countErr } = await supabase
-      .from('pool_members')
-      .select('*', { count: 'exact', head: true })
-      .eq('pool_id', poolId);
-      
+      .from("pool_members")
+      .select("*", { count: "exact", head: true })
+      .eq("pool_id", poolId);
+
     if (!countErr && count >= pool.max_members) {
       await supabase
-        .from('pools')
+        .from("pools")
         .update({ pool_status_id: 2 }) // ACTIVE
-        .eq('id', poolId);
+        .eq("id", poolId);
     }
 
     return res.status(201).json(member);
@@ -208,16 +219,17 @@ export const contribute = async (req, res) => {
       .eq("pool_id", poolId)
       .eq("user_id", user_id)
       .single();
-    if (memberErr || !member) return res.status(400).json({ error: 'Not a member' });
+    if (memberErr || !member)
+      return res.status(400).json({ error: "Not a member" });
 
     // Fetch total members to calculate dynamic contribution
     const { count, error: countErr } = await supabase
-      .from('pool_members')
-      .select('*', { count: 'exact', head: true })
-      .eq('pool_id', poolId);
-      
+      .from("pool_members")
+      .select("*", { count: "exact", head: true })
+      .eq("pool_id", poolId);
+
     if (countErr) throw countErr;
-    
+
     const currentMembers = count || 1;
     const dynamicContribution = pool.total_payout_amount / currentMembers;
 
@@ -321,10 +333,10 @@ export const getPoolState = async (req, res) => {
 export const getAllPools = async (req, res) => {
   try {
     const { data: pools, error } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name)')
-      .in('pool_status_id', [1, 3]);
-    
+      .from("pools")
+      .select("*, pool_statuses(status_name)")
+      .in("pool_status_id", [1, 3]);
+
     if (error) throw error;
     return res.json(pools);
   } catch (err) {
@@ -335,27 +347,27 @@ export const getAllPools = async (req, res) => {
 export const getMyPools = async (req, res) => {
   try {
     const { userId } = req.params;
-    
+
     // Fetch pools where the user is a member
     const { data: members, error: membersErr } = await supabase
-      .from('pool_members')
-      .select('pool_id, pools(*, pool_statuses(status_name))')
-      .eq('user_id', userId);
-      
+      .from("pool_members")
+      .select("pool_id, pools(*, pool_statuses(status_name))")
+      .eq("user_id", userId);
+
     if (membersErr) throw membersErr;
 
     // Fetch pools where the user is the organizer
     const { data: organized, error: organizedErr } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name)')
-      .eq('organizer_id', userId);
+      .from("pools")
+      .select("*, pool_statuses(status_name)")
+      .eq("organizer_id", userId);
 
     if (organizedErr) throw organizedErr;
 
-    const myPools = members.map(m => m.pools);
-    
+    const myPools = members.map((m) => m.pools);
+
     // Merge organized pools, avoiding duplicates
-    const existingPoolIds = new Set(myPools.map(p => p.id));
+    const existingPoolIds = new Set(myPools.map((p) => p.id));
     for (const pool of organized) {
       if (!existingPoolIds.has(pool.id)) {
         myPools.push(pool);
@@ -372,11 +384,13 @@ export const getPoolById = async (req, res) => {
   try {
     const { poolId } = req.params;
     const { data: pool, error } = await supabase
-      .from('pools')
-      .select('*, pool_statuses(status_name), pool_members(*, users(first_name, last_name), member_statuses(status_name))')
-      .eq('id', poolId)
+      .from("pools")
+      .select(
+        "*, pool_statuses(status_name), pool_members(*, users(first_name, last_name), member_statuses(status_name))",
+      )
+      .eq("id", poolId)
       .single();
-      
+
     if (error) throw error;
     return res.json(pool);
   } catch (err) {
