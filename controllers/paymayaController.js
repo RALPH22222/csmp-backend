@@ -246,6 +246,31 @@ export const createPayMayaCheckout = async (req, res) => {
   }
 };
 
+// Get wallet balance from Maya API (Mocked) - EXPORT THIS
+export const getWalletBalance = async (req, res) => {
+  try {
+    const authenticatedUserId =
+      req.user?.id || req.user?.sub || req.user?.userId;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        success: false,
+        error: "User not authenticated",
+      });
+    }
+
+    // Mocking Maya API balance fetch
+    res.status(200).json({
+      success: true,
+      balance: 12500.00,
+      currency: "PHP"
+    });
+  } catch (error) {
+    console.error("Error fetching balance:", error);
+    res.status(500).json({ success: false, error: "Failed to fetch balance" });
+  }
+};
+
 // Check payment status - EXPORT THIS
 export const getPaymentStatus = async (req, res) => {
   try {
@@ -287,10 +312,11 @@ export const payMayaHealthCheck = async (req, res) => {
   }
 };
 
-// Default export for convenience
+// Default export for convenienc
 export default {
   handlePayMayaWebhook,
   createPayMayaCheckout,
   getPaymentStatus,
   payMayaHealthCheck,
+  getWalletBalance,
 };

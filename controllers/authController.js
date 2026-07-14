@@ -145,16 +145,20 @@ async function setupUserStellarAccount(publicKey, secretKey) {
 export const register = async (req, res) => {
   try {
     const {
+      email,
       mobilePhone,
       firstName,
       middleName,
       lastName,
       dateOfBirth,
       sex,
+      province,
+      city,
+      barangay,
       password,
     } = req.body;
 
-    if (!mobilePhone || !firstName || !lastName || !password) {
+    if (!email || !mobilePhone || !firstName || !lastName || !password || !province || !city || !barangay) {
       return res
         .status(400)
         .json({ success: false, message: "Missing required fields" });
@@ -164,19 +168,13 @@ export const register = async (req, res) => {
     const { data: existingUser } = await supabase
       .from("users")
       .select("id")
-      .eq("phone_number", mobilePhone)
+      .or(`phone_number.eq.${mobilePhone},email.eq.${email}`)
       .single();
 
     if (existingUser) {
       return res
         .status(409)
-        .json({ success: false, message: "Phone number already registered" });
-    }
-
-    const otp = generateOTP();
-
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${otp}`);
+        .json({ success: false, message: "Email or Phone number already registered" });
     }
 
     // Generate a new Stellar wallet for the user
@@ -184,24 +182,33 @@ export const register = async (req, res) => {
     const stellarPublicKey = keypair.publicKey();
     const stellarSecretKey = keypair.secret();
 
+    const address = `${barangay}, ${city}, ${province}`;
+
     // Store user payload temporarily with OTP
-    otpStore.set(mobilePhone, {
-      otp,
-      password: encryptText(password),
+    otpStore.set(email, {
       stellarSecretKey,
-      expiresAt: Date.now() + 5 * 60 * 1000,
+      expiresAt: Date.now() + 15 * 60 * 1000,
       userData: {
+        email,
         phone_number: mobilePhone,
         first_name: firstName,
         middle_name: middleName || null,
         last_name: lastName,
         date_of_birth: new Date(dateOfBirth).toISOString().split("T")[0],
         sex,
+        address,
         stellar_public_key: stellarPublicKey,
       },
     });
 
-    await sendOtpSms(mobilePhone, otp);
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+    });
+
+    if (authError) {
+      return res.status(400).json({ success: false, message: authError.message });
+    }
 
     return res.status(200).json({
       success: true,
@@ -218,82 +225,48 @@ export const register = async (req, res) => {
 // --------------------------------------------------------------
 export const verifyOtp = async (req, res) => {
   try {
-    const { mobilePhone, otp } = req.body;
+    const { email, otp } = req.body;
 
-    if (!mobilePhone || !otp) {
+    if (!email || !otp) {
       return res
         .status(400)
-        .json({ success: false, message: "Phone and OTP are required" });
+        .json({ success: false, message: "Email and OTP are required" });
     }
 
-    const record = otpStore.get(mobilePhone);
+    const record = otpStore.get(email);
 
     if (!record) {
       return res
         .status(404)
-        .json({ success: false, message: "OTP not found or expired" });
+        .json({ success: false, message: "Registration session not found or expired" });
     }
 
     if (Date.now() > record.expiresAt) {
-      otpStore.delete(mobilePhone);
+      otpStore.delete(email);
       return res
         .status(400)
-        .json({ success: false, message: "OTP has expired" });
+        .json({ success: false, message: "Registration session has expired" });
     }
 
-    if (record.otp !== otp) {
-      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    const { data: verifyData, error: verifyError } = await supabase.auth.verifyOtp({
+      email,
+      token: otp,
+      type: 'signup'
+    });
+
+    if (verifyError) {
+      return res.status(400).json({ success: false, message: verifyError.message });
     }
 
-    // Create user in Supabase Auth to get auth_id
-    const formattedPhone = formatE164(mobilePhone);
-    let authUserId;
-
-    const { data: createData, error: authError } =
-      await supabase.auth.admin.createUser({
-        phone: formattedPhone,
-        password: decryptText(record.password),
-        phone_confirm: true,
-      });
-
-    if (authError) {
-      if (authError.message.includes("already registered")) {
-        let { data: signInData, error: signInError } =
-          await supabase.auth.signInWithPassword({
-            phone: formattedPhone,
-            password: decryptText(record.password),
-          });
-
-        if (
-          signInError &&
-          signInError.message.includes("Phone logins are disabled")
-        ) {
-          const { data: stuckUser } = await supabase
-            .from("users")
-            .select("auth_id")
-            .eq("phone_number", mobilePhone)
-            .single();
-          if (stuckUser) {
-            signInData = { user: { id: stuckUser.auth_id } };
-            signInError = null;
-          }
-        }
-
-        if (signInData && signInData.user) {
-          authUserId = signInData.user.id;
-        } else {
-          throw new Error(
-            "Phone number is stuck in Supabase Auth. Please delete it manually from the dashboard.",
-          );
-        }
-      } else {
-        throw new Error(`Auth Error: ${authError.message}`);
-      }
-    } else {
-      authUserId = createData.user.id;
-    }
-
+    const authUserId = verifyData.user.id;
     record.userData.auth_id = authUserId;
+
+    // Optional: link phone number to auth user so phone login still works
+    const formattedPhone = formatE164(record.userData.phone_number);
+    await supabase.auth.admin.updateUserById(authUserId, {
+      phone: formattedPhone,
+      phone_confirm: true
+    }).catch(err => console.error("Could not link phone:", err));
 
     // Insert into public.users
     const { data: newUser, error: dbError } = await supabase
@@ -321,52 +294,13 @@ export const verifyOtp = async (req, res) => {
     ).catch((err) => console.error("Stellar setup error:", err));
 
     // Clean up OTP store
-    otpStore.delete(mobilePhone);
-
-    // Sign in the user to return a session
-    let { data: sessionData, error: signInError } =
-      await supabase.auth.signInWithPassword({
-        phone: formattedPhone,
-        password: decryptText(record.password),
-      });
-
-    if (
-      signInError &&
-      signInError.message.includes("Phone logins are disabled")
-    ) {
-      // In your authController.js login function
-      const token = jwt.sign(
-        {
-          aud: "authenticated",
-          exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
-          sub: authUserId,
-          email: "",
-          phone: formattedPhone,
-          app_metadata: { provider: "phone", providers: ["phone"] },
-          user_metadata: {},
-          role: "authenticated",
-        },
-        process.env.JWT_SECRET, // Remove the fallback, use ONLY the env variable
-      );
-
-      sessionData = {
-        session: {
-          access_token: token,
-          refresh_token: token,
-          expires_in: 86400,
-          token_type: "bearer",
-          user: { id: authUserId, phone: formattedPhone },
-        },
-        user: { id: authUserId, phone: formattedPhone },
-      };
-      signInError = null;
-    }
+    otpStore.delete(email);
 
     return res.status(201).json({
       success: true,
       message: "Registration successful",
-      session: sessionData?.session || null,
-      token: sessionData?.session?.access_token || null,
+      session: verifyData.session || null,
+      token: verifyData.session?.access_token || null,
       user: newUser,
     });
   } catch (error) {
@@ -575,35 +509,22 @@ export const refreshSession = async (req, res) => {
 
 export const resendOtp = async (req, res) => {
   try {
-    const { mobilePhone } = req.body;
+    const { email } = req.body;
 
-    if (!mobilePhone) {
+    if (!email) {
       return res
         .status(400)
-        .json({ success: false, message: "Phone number is required" });
+        .json({ success: false, message: "Email is required" });
     }
 
-    const record = otpStore.get(mobilePhone);
-    if (!record) {
-      return res.status(404).json({
-        success: false,
-        message: "User session not found. Please restart registration.",
-      });
-    }
-
-    const newOtp = generateOTP();
-
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`🔑 [DEV] OTP for ${mobilePhone}: ${newOtp}`);
-    }
-
-    otpStore.set(mobilePhone, {
-      ...record,
-      otp: newOtp,
-      expiresAt: Date.now() + 5 * 60 * 1000,
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email
     });
 
-    await sendOtpSms(mobilePhone, newOtp);
+    if (error) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
 
     return res
       .status(200)

@@ -23,7 +23,9 @@ import {
   createPayMayaCheckout,
   getPaymentStatus,
   payMayaHealthCheck,
+  getWalletBalance,
 } from "../controllers/paymayaController.js";
+import { getUserHistory } from "../controllers/transactionController.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
@@ -46,6 +48,9 @@ router.post("/auth/login", login);
 router.post("/auth/verify-login", verifyLoginOtp);
 router.post("/auth/refresh", refreshSession);
 
+// Transaction Routes
+router.get("/transactions/history", verifyToken, getUserHistory);
+
 // PayMaya Routes
 router.post("/paymaya-webhook", handlePayMayaWebhook); // Webhook is public
 router.post("/paymaya/checkout", verifyToken, createPayMayaCheckout); // Protected
@@ -55,6 +60,7 @@ router.get(
   getPaymentStatus,
 ); // Protected
 router.get("/paymaya/health", payMayaHealthCheck);
+router.get("/paymaya/balance", verifyToken, getWalletBalance); // Protected
 
 // Payment redirect pages (public)
 router.get("/payment/success", (req, res) => {
