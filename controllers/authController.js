@@ -207,7 +207,8 @@ export const register = async (req, res) => {
     });
 
     if (authError) {
-      return res.status(400).json({ success: false, message: authError.message });
+      console.error("Supabase auth.signUp error:", authError);
+      return res.status(400).json({ success: false, message: authError.message || authError });
     }
 
     return res.status(200).json({
@@ -215,8 +216,8 @@ export const register = async (req, res) => {
       message: "OTP sent successfully.",
     });
   } catch (error) {
-    console.error("Registration Error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("Registration Error caught in try-catch:", error);
+    return res.status(500).json({ success: false, message: error.message || error });
   }
 };
 
